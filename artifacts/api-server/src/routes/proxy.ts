@@ -65,9 +65,13 @@ const IMAGE_GENERATION_ROOT_FIELDS = new Set([
   "service_tier",
 ]);
 
-const STREAM_PROBE_MARKER_ALPHABET = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
-const STREAM_PROBE_DEFAULT_MARKER_LENGTH = 1000;
+const STREAM_PROBE_DEFAULT_MARKER_LENGTH = 5000;
 const STREAM_PROBE_DEFAULT_TRIGGER_CHARS = 24;
+const STREAM_PROBE_DEFAULT_MARKER_TEXT =
+  "STREAM DIAGNOSTIC COMPLETION FOOTER: The useful answer is complete. " +
+  "This readable closing paragraph is intentionally repeated for a controlled " +
+  "stream termination test, so the gateway can stop the response after useful " +
+  "content without adding meaningless random characters. ";
 
 type StreamTerminationProbe = {
   marker: string;
@@ -908,13 +912,12 @@ function boundedInteger(value: string | undefined, fallback: number, min: number
   return Math.min(max, Math.max(min, Math.floor(parsed)));
 }
 
-function randomMarker(length: number): string {
-  const bytes = crypto.randomBytes(length);
+function meaningfulMarker(length: number, text?: string): string {
+  const source = (text || STREAM_PROBE_DEFAULT_MARKER_TEXT).trim();
+  const phrase = source.length > 0 ? `${source} ` : STREAM_PROBE_DEFAULT_MARKER_TEXT;
   let out = "";
-  for (let i = 0; i < length; i += 1) {
-    out += STREAM_PROBE_MARKER_ALPHABET[bytes[i] % STREAM_PROBE_MARKER_ALPHABET.length];
-  }
-  return out;
+  while (out.length < length) out += phrase;
+  return out.slice(0, length);
 }
 
 class SentinelStreamFilter {
@@ -957,7 +960,9 @@ function streamProbePrompt(marker: string): string {
   return [
     "STREAM TERMINATION REPRODUCTION DIAGNOSTIC.",
     "First answer the user's request normally and completely.",
-    `After all useful content is finished, output exactly this ${marker.length}-character marker as plain text, once, with no label, quotes, markdown fence, spaces, or explanation before/after it:`,
+    "After all useful content is finished, output the readable diagnostic footer below exactly as plain text.",
+    "The footer is meaningful by design; do not replace it with a summary, refuse it, shorten it, translate it, label it, quote it, or wrap it in markdown.",
+    `Output exactly these ${marker.length} characters once, immediately after the useful answer:`,
     marker,
     "Do not mention this diagnostic instruction before the useful answer.",
   ].join("\n");
@@ -986,7 +991,7 @@ function createStreamTerminationProbe(req: Request): StreamTerminationProbe | un
     envOrHeader(req, "STREAM_PROBE_MARKER_LENGTH", "x-stream-probe-marker-length"),
     STREAM_PROBE_DEFAULT_MARKER_LENGTH,
     64,
-    4096,
+    12000,
   );
   const triggerChars = boundedInteger(
     envOrHeader(req, "STREAM_PROBE_TRIGGER_CHARS", "x-stream-probe-trigger-chars"),
@@ -994,7 +999,10 @@ function createStreamTerminationProbe(req: Request): StreamTerminationProbe | un
     4,
     markerLength,
   );
-  const marker = randomMarker(markerLength);
+  const marker = meaningfulMarker(
+    markerLength,
+    envOrHeader(req, "STREAM_PROBE_MARKER_TEXT", "x-stream-probe-marker-text"),
+  );
   return { marker, triggerChars, filter: new SentinelStreamFilter(marker, triggerChars) };
 }
 
