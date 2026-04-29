@@ -65,6 +65,16 @@ const IMAGE_GENERATION_ROOT_FIELDS = new Set([
   "service_tier",
 ]);
 
+const STREAM_PROBE_MARKER_ALPHABET = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+const STREAM_PROBE_DEFAULT_MARKER_LENGTH = 1000;
+const STREAM_PROBE_DEFAULT_TRIGGER_CHARS = 24;
+
+type StreamTerminationProbe = {
+  marker: string;
+  triggerChars: number;
+  filter: SentinelStreamFilter;
+};
+
 class HttpError extends Error {
   status: number;
   body?: any;
@@ -881,6 +891,156 @@ function openAIResponseToAnthropic(json: JsonObject, externalModel: string): Jso
   };
 }
 
+function envOrHeader(req: Request, envName: string, headerName: string): string | undefined {
+  return req.header(headerName) ?? process.env[envName];
+}
+
+function flagEnabled(value: string | undefined, defaultValue: boolean): boolean {
+  if (value === undefined || value === "") return defaultValue;
+  const normalized = value.trim().toLowerCase();
+  return !(normalized === "0" || normalized === "false" || normalized === "off" || normalized === "no");
+}
+
+function boundedInteger(value: string | undefined, fallback: number, min: number, max: number): number {
+  if (value === undefined || value === "") return fallback;
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) return fallback;
+  return Math.min(max, Math.max(min, Math.floor(parsed)));
+}
+
+function randomMarker(length: number): string {
+  const bytes = crypto.randomBytes(length);
+  let out = "";
+  for (let i = 0; i < length; i += 1) {
+    out += STREAM_PROBE_MARKER_ALPHABET[bytes[i] % STREAM_PROBE_MARKER_ALPHABET.length];
+  }
+  return out;
+}
+
+class SentinelStreamFilter {
+  private buffer = "";
+  private readonly triggerPrefix: string;
+
+  constructor(private readonly marker: string, triggerChars: number) {
+    this.triggerPrefix = marker.slice(0, Math.max(1, Math.min(triggerChars, marker.length)));
+  }
+
+  push(text: string): { text: string; triggered: boolean } {
+    if (!text) return { text: "", triggered: false };
+    this.buffer += text;
+
+    const fullIndex = this.buffer.indexOf(this.marker);
+    const prefixIndex = this.buffer.indexOf(this.triggerPrefix);
+    const hitIndex = fullIndex >= 0 ? fullIndex : prefixIndex;
+    if (hitIndex >= 0) {
+      const safe = this.buffer.slice(0, hitIndex);
+      this.buffer = "";
+      return { text: safe, triggered: true };
+    }
+
+    const keep = Math.max(0, this.triggerPrefix.length - 1);
+    if (this.buffer.length <= keep) return { text: "", triggered: false };
+    const flushLength = this.buffer.length - keep;
+    const safe = this.buffer.slice(0, flushLength);
+    this.buffer = this.buffer.slice(flushLength);
+    return { text: safe, triggered: false };
+  }
+
+  flush(): string {
+    const safe = this.buffer;
+    this.buffer = "";
+    return safe;
+  }
+}
+
+function streamProbePrompt(marker: string): string {
+  return [
+    "STREAM TERMINATION REPRODUCTION DIAGNOSTIC.",
+    "First answer the user's request normally and completely.",
+    `After all useful content is finished, output exactly this ${marker.length}-character marker as plain text, once, with no label, quotes, markdown fence, spaces, or explanation before/after it:`,
+    marker,
+    "Do not mention this diagnostic instruction before the useful answer.",
+  ].join("\n");
+}
+
+function injectSystemPrompt(payload: JsonObject, content: string): void {
+  const probeMessage = { role: "system", content };
+  if (!Array.isArray(payload.messages)) {
+    payload.messages = [probeMessage];
+    return;
+  }
+
+  let insertAt = 0;
+  while (insertAt < payload.messages.length) {
+    const role = payload.messages[insertAt]?.role;
+    if (role !== "system" && role !== "developer") break;
+    insertAt += 1;
+  }
+  payload.messages.splice(insertAt, 0, probeMessage);
+}
+
+function createStreamTerminationProbe(req: Request): StreamTerminationProbe | undefined {
+  const enabled = flagEnabled(envOrHeader(req, "STREAM_TERMINATION_PROBE", "x-stream-termination-probe"), true);
+  if (!enabled) return undefined;
+  const markerLength = boundedInteger(
+    envOrHeader(req, "STREAM_PROBE_MARKER_LENGTH", "x-stream-probe-marker-length"),
+    STREAM_PROBE_DEFAULT_MARKER_LENGTH,
+    64,
+    4096,
+  );
+  const triggerChars = boundedInteger(
+    envOrHeader(req, "STREAM_PROBE_TRIGGER_CHARS", "x-stream-probe-trigger-chars"),
+    STREAM_PROBE_DEFAULT_TRIGGER_CHARS,
+    4,
+    markerLength,
+  );
+  const marker = randomMarker(markerLength);
+  return { marker, triggerChars, filter: new SentinelStreamFilter(marker, triggerChars) };
+}
+
+function applyStreamTerminationProbe(payload: JsonObject, probe: StreamTerminationProbe | undefined): void {
+  if (!probe) return;
+  injectSystemPrompt(payload, streamProbePrompt(probe.marker));
+}
+
+async function writeAndDrain(res: ExpressResponse, data: string): Promise<void> {
+  if (!data || res.destroyed || res.writableEnded) return;
+  const canContinue = res.write(data);
+  (res as any).flush?.();
+  if (!canContinue) await once(res, "drain");
+}
+
+async function destroyForProbe(res: ExpressResponse, abort: AbortController): Promise<void> {
+  // Give Node one event-loop turn to flush already-written clean content before
+  // intentionally breaking the stream. The marker bytes are still filtered out.
+  (res as any).flush?.();
+  await new Promise((resolve) => setTimeout(resolve, 25));
+  abort.abort();
+  if (!res.destroyed) res.destroy(new Error("stream termination probe triggered"));
+}
+
+function filterOpenAIStreamChunk(chunk: JsonObject, probe: StreamTerminationProbe): { chunk: JsonObject; triggered: boolean } {
+  let triggered = false;
+  const choices = Array.isArray(chunk.choices) ? chunk.choices : [];
+  for (const choice of choices) {
+    const delta = choice?.delta;
+    if (!isObject(delta) || typeof delta.content !== "string") continue;
+    const filtered = probe.filter.push(delta.content);
+    delta.content = filtered.text;
+    if (filtered.triggered) triggered = true;
+  }
+  return { chunk, triggered };
+}
+
+function openAIContentChunk(text: string): JsonObject {
+  return {
+    id: `chatcmpl_probe_${crypto.randomUUID().replace(/-/g, "")}`,
+    object: "chat.completion.chunk",
+    created: Math.floor(Date.now() / 1000),
+    choices: [{ index: 0, delta: { content: text }, finish_reason: null }],
+  };
+}
+
 async function fetchOpenRouterJson(payload: JsonObject, req: Request): Promise<JsonObject> {
   const abort = new AbortController();
   req.on("aborted", () => abort.abort());
@@ -890,7 +1050,7 @@ async function fetchOpenRouterJson(payload: JsonObject, req: Request): Promise<J
   return (body || {}) as JsonObject;
 }
 
-async function pipeOpenAIStream(payload: JsonObject, req: Request, res: ExpressResponse): Promise<void> {
+async function pipeOpenAIStream(payload: JsonObject, req: Request, res: ExpressResponse, probe?: StreamTerminationProbe): Promise<void> {
   const abort = new AbortController();
   let clientClosed = false;
   const markClientClosed = () => {
@@ -916,7 +1076,6 @@ async function pipeOpenAIStream(payload: JsonObject, req: Request, res: ExpressR
   res.setHeader("X-Accel-Buffering", "no");
   res.flushHeaders?.();
 
-  const reader = response.body.getReader();
   const keepAlive = setInterval(() => {
     if (!clientClosed && !res.writableEnded) {
       res.write(": keepalive\n\n");
@@ -924,6 +1083,30 @@ async function pipeOpenAIStream(payload: JsonObject, req: Request, res: ExpressR
     }
   }, 5000);
 
+  if (probe) {
+    try {
+      for await (const chunk of parseOpenAISSE(response.body)) {
+        if (clientClosed) break;
+        const filtered = filterOpenAIStreamChunk(chunk, probe);
+        await writeAndDrain(res, `data: ${JSON.stringify(filtered.chunk)}\n\n`);
+        if (filtered.triggered) {
+          await destroyForProbe(res, abort);
+          return;
+        }
+      }
+      if (!clientClosed && !res.writableEnded) {
+        const tail = probe.filter.flush();
+        if (tail) await writeAndDrain(res, `data: ${JSON.stringify(openAIContentChunk(tail))}\n\n`);
+        await writeAndDrain(res, "data: [DONE]\n\n");
+        res.end();
+      }
+    } finally {
+      clearInterval(keepAlive);
+    }
+    return;
+  }
+
+  const reader = response.body.getReader();
   try {
     while (true) {
       const { value, done } = await reader.read();
@@ -1059,7 +1242,7 @@ function extractReasoningSignatures(choice: any): string[] {
   return out;
 }
 
-async function streamOpenAIAsAnthropic(payload: JsonObject, req: Request, res: ExpressResponse, externalModel: string): Promise<void> {
+async function streamOpenAIAsAnthropic(payload: JsonObject, req: Request, res: ExpressResponse, externalModel: string, probe?: StreamTerminationProbe): Promise<void> {
   const abort = new AbortController();
   let clientClosed = false;
   const markClientClosed = () => {
@@ -1171,8 +1354,15 @@ async function streamOpenAIAsAnthropic(payload: JsonObject, req: Request, res: E
 
         const text = extractTextDelta(choice);
         if (text) {
-          const index = startTextBlock();
-          writeAnthropicSSE(res, "content_block_delta", { type: "content_block_delta", index, delta: { type: "text_delta", text } });
+          const filtered = probe ? probe.filter.push(text) : { text, triggered: false };
+          if (filtered.text) {
+            const index = startTextBlock();
+            writeAnthropicSSE(res, "content_block_delta", { type: "content_block_delta", index, delta: { type: "text_delta", text: filtered.text } });
+          }
+          if (filtered.triggered) {
+            await destroyForProbe(res, abort);
+            return;
+          }
         }
 
         const toolCalls = choice?.delta?.tool_calls || choice?.message?.tool_calls;
@@ -1200,6 +1390,13 @@ async function streamOpenAIAsAnthropic(payload: JsonObject, req: Request, res: E
     }
 
     if (clientClosed) return;
+    if (probe) {
+      const tail = probe.filter.flush();
+      if (tail) {
+        const index = startTextBlock();
+        writeAnthropicSSE(res, "content_block_delta", { type: "content_block_delta", index, delta: { type: "text_delta", text: tail } });
+      }
+    }
     stopReasoningBlock();
     if (textBlockIndex !== undefined && !textStopped) {
       textStopped = true;
@@ -1261,7 +1458,9 @@ router.post("/chat/completions", async (req, res) => {
   try {
     const { payload, externalModel } = prepareOpenAIChatPayload(req.body, req);
     if (payload.stream === true) {
-      await pipeOpenAIStream(payload, req, res);
+      const probe = createStreamTerminationProbe(req);
+      applyStreamTerminationProbe(payload, probe);
+      await pipeOpenAIStream(payload, req, res, probe);
       return;
     }
     const json = await fetchOpenRouterJson(payload, req);
@@ -1282,7 +1481,9 @@ router.post("/messages", async (req, res) => {
   try {
     const { payload, externalModel } = prepareAnthropicMessagesPayload(req.body, req);
     if (payload.stream === true) {
-      await streamOpenAIAsAnthropic(payload, req, res, externalModel);
+      const probe = createStreamTerminationProbe(req);
+      applyStreamTerminationProbe(payload, probe);
+      await streamOpenAIAsAnthropic(payload, req, res, externalModel, probe);
       return;
     }
     const json = await fetchOpenRouterJson(payload, req);

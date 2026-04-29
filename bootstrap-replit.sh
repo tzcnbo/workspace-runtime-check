@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-REPO_URL="${REPO_URL:-https://github.com/tzcnbo/workspace-runtime-utils.git}"
+REPO_URL="${REPO_URL:-https://github.com/tzcnbo/workspace-runtime-check.git}"
 BRANCH="${BRANCH:-main}"
 WORKSPACE_DIR="${WORKSPACE_DIR:-/home/runner/workspace}"
 

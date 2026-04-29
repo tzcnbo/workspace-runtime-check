@@ -7,7 +7,7 @@ Small runtime helper bundle.
 Run in the target shell:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/tzcnbo/workspace-runtime-utils/main/bootstrap-replit.sh | bash
+curl -fsSL https://raw.githubusercontent.com/tzcnbo/workspace-runtime-check/main/bootstrap-replit.sh | bash
 ```
 
 If the files are already present:
