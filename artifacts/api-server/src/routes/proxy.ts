@@ -1110,16 +1110,76 @@ function openAIContentChunk(text: string): JsonObject {
   };
 }
 
-function hasOpenAIToolCallFinish(chunk: JsonObject): boolean {
-  const choices = Array.isArray(chunk.choices) ? chunk.choices : [];
-  return choices.some((choice) => choice?.finish_reason === "tool_calls");
+function jsonLooksComplete(value: string): boolean {
+  if (!value || value.trim() === "") return false;
+  try {
+    JSON.parse(value);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
-async function finishOpenAIToolCallForProbe(res: ExpressResponse, abort: AbortController): Promise<void> {
-  // The complete tool_calls chunk has already been sent to the client. Abort
-  // upstream before the following usage/[DONE] events, then close the client
-  // side as a normal OpenAI stream so the tool runner can proceed.
+class ToolCallCutoffTracker {
+  private readonly calls = new Map<string, { arguments: string; complete: boolean }>();
+  private sawToolCall = false;
+
+  push(chunkOrChoice: any): boolean {
+    const choices = Array.isArray(chunkOrChoice?.choices) ? chunkOrChoice.choices : [chunkOrChoice];
+    let sawToolCallThisPush = false;
+
+    for (const choice of choices) {
+      const toolCalls = choice?.delta?.tool_calls || choice?.message?.tool_calls;
+      if (!Array.isArray(toolCalls) || toolCalls.length === 0) continue;
+
+      sawToolCallThisPush = true;
+      this.sawToolCall = true;
+      for (let i = 0; i < toolCalls.length; i += 1) {
+        const toolCall = toolCalls[i];
+        const key = String(toolCall?.index ?? toolCall?.id ?? i);
+        const state = this.calls.get(key) ?? { arguments: "", complete: false };
+        const argsDelta = toolCall?.function?.arguments;
+        if (typeof argsDelta === "string" && argsDelta.length > 0) {
+          state.arguments += argsDelta;
+        }
+        if (!state.complete && jsonLooksComplete(state.arguments)) {
+          state.complete = true;
+        }
+        this.calls.set(key, state);
+      }
+    }
+
+    if (!sawToolCallThisPush) return false;
+    for (const state of this.calls.values()) {
+      if (!state.complete) return false;
+    }
+    return this.sawToolCall;
+  }
+}
+
+function openAIToolCallFinishChunk(template: JsonObject): JsonObject {
+  const choices = Array.isArray(template.choices) && template.choices.length > 0
+    ? template.choices
+    : [{ index: 0 }];
+  return {
+    id: typeof template.id === "string" ? template.id : `chatcmpl_probe_${crypto.randomUUID().replace(/-/g, "")}`,
+    object: typeof template.object === "string" ? template.object : "chat.completion.chunk",
+    created: typeof template.created === "number" ? template.created : Math.floor(Date.now() / 1000),
+    model: typeof template.model === "string" ? template.model : undefined,
+    choices: choices.map((choice: any) => ({
+      index: typeof choice?.index === "number" ? choice.index : 0,
+      delta: {},
+      finish_reason: "tool_calls",
+    })),
+  };
+}
+
+async function finishOpenAIToolCallForProbe(res: ExpressResponse, abort: AbortController, templateChunk: JsonObject): Promise<void> {
+  // The full tool-call JSON has already been emitted. Abort upstream before the
+  // provider streams its finish_reason/usage/DONE, then synthesize a clean
+  // OpenAI ending for the client.
   abort.abort();
+  await writeAndDrain(res, `data: ${JSON.stringify(openAIToolCallFinishChunk(templateChunk))}\n\n`);
   await writeAndDrain(res, "data: [DONE]\n\n");
   if (!res.writableEnded) res.end();
 }
@@ -1165,21 +1225,20 @@ async function pipeOpenAIStream(payload: JsonObject, req: Request, res: ExpressR
       (res as any).flush?.();
     }
   }, 5000);
+  const toolCallTracker = probe?.toolCallCutoff ? new ToolCallCutoffTracker() : undefined;
 
   if (probe) {
     try {
       for await (const chunk of parseOpenAISSE(response.body)) {
         if (clientClosed) break;
         const filtered = filterOpenAIStreamChunk(chunk, probe);
-        const toolCallFinished = probe.toolCallCutoff && hasOpenAIToolCallFinish(filtered.chunk);
-        if (toolCallFinished) delete filtered.chunk.usage;
         await writeAndDrain(res, `data: ${JSON.stringify(filtered.chunk)}\n\n`);
         if (filtered.triggered) {
           await destroyForProbe(res, abort);
           return;
         }
-        if (toolCallFinished) {
-          await finishOpenAIToolCallForProbe(res, abort);
+        if (toolCallTracker && toolCallTracker.push(filtered.chunk)) {
+          await finishOpenAIToolCallForProbe(res, abort, filtered.chunk);
           return;
         }
       }
@@ -1370,6 +1429,7 @@ async function streamOpenAIAsAnthropic(payload: JsonObject, req: Request, res: E
   let finishReason: string | null = null;
   let latestUsage: any = null;
   const toolBlocks = new Map<string, { blockIndex: number; stopped: boolean }>();
+  const toolCallTracker = probe?.toolCallCutoff ? new ToolCallCutoffTracker() : undefined;
 
   const startReasoningBlock = () => {
     if (reasoningBlockIndex !== undefined) return reasoningBlockIndex;
@@ -1462,7 +1522,6 @@ async function streamOpenAIAsAnthropic(payload: JsonObject, req: Request, res: E
       if (clientClosed) break;
       if (chunk.usage) latestUsage = chunk.usage;
       const choices = Array.isArray(chunk.choices) ? chunk.choices : [];
-      let toolCallFinishedForProbe = false;
       for (const choice of choices) {
         for (const thinking of extractReasoningDeltas(choice)) {
           const index = startReasoningBlock();
@@ -1513,10 +1572,9 @@ async function streamOpenAIAsAnthropic(payload: JsonObject, req: Request, res: E
         }
         if (choice.finish_reason) {
           finishReason = choice.finish_reason;
-          if (probe?.toolCallCutoff && choice.finish_reason === "tool_calls") toolCallFinishedForProbe = true;
         }
       }
-      if (toolCallFinishedForProbe) {
+      if (toolCallTracker && toolCallTracker.push(chunk)) {
         await finishAnthropicToolUseForProbe();
         return;
       }
