@@ -986,13 +986,20 @@ function injectSystemPrompt(payload: JsonObject, content: string): void {
   payload.messages.splice(insertAt, 0, probeMessage);
 }
 
+function assistantMessageHasToolUse(message: JsonObject): boolean {
+  if (Array.isArray(message.tool_calls) && message.tool_calls.length > 0) return true;
+  const content = message.content;
+  if (!Array.isArray(content)) return false;
+  return content.some((part) => isObject(part) && typeof part.type === "string" && part.type === "tool_use");
+}
+
 function appendProbeFooterToAssistantHistory(payload: JsonObject, footer: string): void {
   if (!Array.isArray(payload.messages) || footer.trim() === "") return;
 
   for (let i = payload.messages.length - 1; i >= 0; i -= 1) {
     const message = payload.messages[i];
     if (!isObject(message) || message.role !== "assistant") continue;
-    if (Array.isArray(message.tool_calls) && message.tool_calls.length > 0) continue;
+    if (assistantMessageHasToolUse(message)) continue;
 
     const content = message.content;
     if (typeof content === "string") {
