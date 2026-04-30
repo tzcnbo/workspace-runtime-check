@@ -76,6 +76,7 @@ const STREAM_PROBE_DEFAULT_MARKER_TEXT =
 type StreamTerminationProbe = {
   marker: string;
   triggerChars: number;
+  toolCallCutoff: boolean;
   filter: SentinelStreamFilter;
 };
 
@@ -1003,7 +1004,11 @@ function createStreamTerminationProbe(req: Request): StreamTerminationProbe | un
     markerLength,
     envOrHeader(req, "STREAM_PROBE_MARKER_TEXT", "x-stream-probe-marker-text"),
   );
-  return { marker, triggerChars, filter: new SentinelStreamFilter(marker, triggerChars) };
+  const toolCallCutoff = flagEnabled(
+    envOrHeader(req, "STREAM_PROBE_TOOL_CALL_CUTOFF", "x-stream-probe-tool-call-cutoff"),
+    true,
+  );
+  return { marker, triggerChars, toolCallCutoff, filter: new SentinelStreamFilter(marker, triggerChars) };
 }
 
 function applyStreamTerminationProbe(payload: JsonObject, probe: StreamTerminationProbe | undefined): void {
@@ -1047,6 +1052,20 @@ function openAIContentChunk(text: string): JsonObject {
     created: Math.floor(Date.now() / 1000),
     choices: [{ index: 0, delta: { content: text }, finish_reason: null }],
   };
+}
+
+function hasOpenAIToolCallFinish(chunk: JsonObject): boolean {
+  const choices = Array.isArray(chunk.choices) ? chunk.choices : [];
+  return choices.some((choice) => choice?.finish_reason === "tool_calls");
+}
+
+async function finishOpenAIToolCallForProbe(res: ExpressResponse, abort: AbortController): Promise<void> {
+  // The complete tool_calls chunk has already been sent to the client. Abort
+  // upstream before the following usage/[DONE] events, then close the client
+  // side as a normal OpenAI stream so the tool runner can proceed.
+  abort.abort();
+  await writeAndDrain(res, "data: [DONE]\n\n");
+  if (!res.writableEnded) res.end();
 }
 
 async function fetchOpenRouterJson(payload: JsonObject, req: Request): Promise<JsonObject> {
@@ -1096,9 +1115,15 @@ async function pipeOpenAIStream(payload: JsonObject, req: Request, res: ExpressR
       for await (const chunk of parseOpenAISSE(response.body)) {
         if (clientClosed) break;
         const filtered = filterOpenAIStreamChunk(chunk, probe);
+        const toolCallFinished = probe.toolCallCutoff && hasOpenAIToolCallFinish(filtered.chunk);
+        if (toolCallFinished) delete filtered.chunk.usage;
         await writeAndDrain(res, `data: ${JSON.stringify(filtered.chunk)}\n\n`);
         if (filtered.triggered) {
           await destroyForProbe(res, abort);
+          return;
+        }
+        if (toolCallFinished) {
+          await finishOpenAIToolCallForProbe(res, abort);
           return;
         }
       }
@@ -1328,6 +1353,40 @@ async function streamOpenAIAsAnthropic(payload: JsonObject, req: Request, res: E
     return textBlockIndex;
   };
 
+  const stopTextBlock = () => {
+    if (textBlockIndex !== undefined && !textStopped) {
+      textStopped = true;
+      writeAnthropicSSE(res, "content_block_stop", { type: "content_block_stop", index: textBlockIndex });
+    }
+  };
+
+  const stopToolBlocks = () => {
+    for (const [, state] of toolBlocks) {
+      if (!state.stopped) {
+        state.stopped = true;
+        writeAnthropicSSE(res, "content_block_stop", { type: "content_block_stop", index: state.blockIndex });
+      }
+    }
+  };
+
+  const finishAnthropicToolUseForProbe = async () => {
+    // The full tool_use block has been emitted. Abort upstream before it can
+    // stream usage, but synthesize a normal Anthropic tool_use ending so
+    // Claude Desktop/Code can execute the tool.
+    stopReasoningBlock();
+    stopTextBlock();
+    stopToolBlocks();
+    abort.abort();
+    writeAnthropicSSE(res, "message_delta", {
+      type: "message_delta",
+      delta: { stop_reason: "tool_use", stop_sequence: null },
+      usage: { output_tokens: 0 },
+    });
+    writeAnthropicSSE(res, "message_stop", { type: "message_stop" });
+    (res as any).flush?.();
+    if (!res.writableEnded) res.end();
+  };
+
   try {
     writeAnthropicSSE(res, "message_start", {
       type: "message_start",
@@ -1347,6 +1406,7 @@ async function streamOpenAIAsAnthropic(payload: JsonObject, req: Request, res: E
       if (clientClosed) break;
       if (chunk.usage) latestUsage = chunk.usage;
       const choices = Array.isArray(chunk.choices) ? chunk.choices : [];
+      let toolCallFinishedForProbe = false;
       for (const choice of choices) {
         for (const thinking of extractReasoningDeltas(choice)) {
           const index = startReasoningBlock();
@@ -1383,6 +1443,8 @@ async function streamOpenAIAsAnthropic(payload: JsonObject, req: Request, res: E
             const id = toolCall.id || `call_${crypto.randomUUID().replace(/-/g, "")}`;
             const name = toolCall.function?.name || "tool";
             if (!state) {
+              stopReasoningBlock();
+              stopTextBlock();
               state = { blockIndex, stopped: false };
               toolBlocks.set(key, state);
               writeAnthropicSSE(res, "content_block_start", { type: "content_block_start", index: blockIndex, content_block: { type: "tool_use", id, name, input: {} } });
@@ -1393,7 +1455,14 @@ async function streamOpenAIAsAnthropic(payload: JsonObject, req: Request, res: E
             }
           }
         }
-        if (choice.finish_reason) finishReason = choice.finish_reason;
+        if (choice.finish_reason) {
+          finishReason = choice.finish_reason;
+          if (probe?.toolCallCutoff && choice.finish_reason === "tool_calls") toolCallFinishedForProbe = true;
+        }
+      }
+      if (toolCallFinishedForProbe) {
+        await finishAnthropicToolUseForProbe();
+        return;
       }
     }
 
@@ -1406,16 +1475,8 @@ async function streamOpenAIAsAnthropic(payload: JsonObject, req: Request, res: E
       }
     }
     stopReasoningBlock();
-    if (textBlockIndex !== undefined && !textStopped) {
-      textStopped = true;
-      writeAnthropicSSE(res, "content_block_stop", { type: "content_block_stop", index: textBlockIndex });
-    }
-    for (const [, state] of toolBlocks) {
-      if (!state.stopped) {
-        state.stopped = true;
-        writeAnthropicSSE(res, "content_block_stop", { type: "content_block_stop", index: state.blockIndex });
-      }
-    }
+    stopTextBlock();
+    stopToolBlocks();
 
     const usage = mapUsageToAnthropic(latestUsage);
     writeAnthropicSSE(res, "message_delta", {
