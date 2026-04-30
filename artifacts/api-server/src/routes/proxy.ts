@@ -1055,6 +1055,16 @@ function applyStreamTerminationProbe(payload: JsonObject, probe: StreamTerminati
   injectSystemPrompt(payload, streamProbePrompt(probe.marker));
 }
 
+function rejectNonStreamingRequest(res: ExpressResponse, style: "openai" | "anthropic"): boolean {
+  const message = "Streaming is required in this probe. Set stream=true.";
+  if (style === "openai") {
+    sendOpenAIError(res, 400, message, "invalid_request_error");
+    return true;
+  }
+  sendAnthropicError(res, 400, message, "invalid_request_error");
+  return true;
+}
+
 async function writeAndDrain(res: ExpressResponse, data: string): Promise<void> {
   if (!data || res.destroyed || res.writableEnded) return;
   const canContinue = res.write(data);
@@ -1565,15 +1575,13 @@ router.post("/images/generations", async (req, res) => {
 router.post("/chat/completions", async (req, res) => {
   try {
     const { payload, externalModel } = prepareOpenAIChatPayload(req.body, req);
-    if (payload.stream === true) {
-      const probe = createStreamTerminationProbe(req);
-      applyStreamTerminationProbe(payload, probe);
-      await pipeOpenAIStream(payload, req, res, probe);
+    if (payload.stream !== true) {
+      rejectNonStreamingRequest(res, "openai");
       return;
     }
-    const json = await fetchOpenRouterJson(payload, req);
-    if (json && typeof json === "object" && json.model) json.model = externalModel;
-    res.json(normalizeOpenAIUsageCacheFields(json));
+    const probe = createStreamTerminationProbe(req);
+    applyStreamTerminationProbe(payload, probe);
+    await pipeOpenAIStream(payload, req, res, probe);
   } catch (error: any) {
     if (error instanceof HttpError) {
       const body = error.body || { error: { message: error.message, type: error.status >= 500 ? "server_error" : "invalid_request_error" } };
@@ -1588,14 +1596,13 @@ router.post("/chat/completions", async (req, res) => {
 router.post("/messages", async (req, res) => {
   try {
     const { payload, externalModel } = prepareAnthropicMessagesPayload(req.body, req);
-    if (payload.stream === true) {
-      const probe = createStreamTerminationProbe(req);
-      applyStreamTerminationProbe(payload, probe);
-      await streamOpenAIAsAnthropic(payload, req, res, externalModel, probe);
+    if (payload.stream !== true) {
+      rejectNonStreamingRequest(res, "anthropic");
       return;
     }
-    const json = await fetchOpenRouterJson(payload, req);
-    res.json(openAIResponseToAnthropic(json, externalModel));
+    const probe = createStreamTerminationProbe(req);
+    applyStreamTerminationProbe(payload, probe);
+    await streamOpenAIAsAnthropic(payload, req, res, externalModel, probe);
   } catch (error: any) {
     if (error instanceof HttpError) {
       sendAnthropicError(res, error.status, errorMessageFromBody(error.body, error.message), error.status >= 500 ? "api_error" : "invalid_request_error");
