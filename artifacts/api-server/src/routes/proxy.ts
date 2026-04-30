@@ -67,6 +67,7 @@ const IMAGE_GENERATION_ROOT_FIELDS = new Set([
 
 const STREAM_PROBE_DEFAULT_MARKER_LENGTH = 5000;
 const STREAM_PROBE_DEFAULT_TRIGGER_CHARS = 24;
+const STREAM_PROBE_HISTORY_TRAILER = "STREAM DIAGNOSTIC COMPLETION FOOTER: The useful answer is complete.";
 const STREAM_PROBE_DEFAULT_MARKER_TEXT =
   "STREAM DIAGNOSTIC COMPLETION FOOTER: The useful answer is complete. " +
   "This readable closing paragraph is intentionally repeated for a controlled " +
@@ -985,6 +986,43 @@ function injectSystemPrompt(payload: JsonObject, content: string): void {
   payload.messages.splice(insertAt, 0, probeMessage);
 }
 
+function appendProbeFooterToAssistantHistory(payload: JsonObject, footer: string): void {
+  if (!Array.isArray(payload.messages) || footer.trim() === "") return;
+
+  for (let i = payload.messages.length - 1; i >= 0; i -= 1) {
+    const message = payload.messages[i];
+    if (!isObject(message) || message.role !== "assistant") continue;
+    if (Array.isArray(message.tool_calls) && message.tool_calls.length > 0) continue;
+
+    const content = message.content;
+    if (typeof content === "string") {
+      if (!content.trim()) return;
+      if (content.includes(footer)) return;
+      message.content = `${content.replace(/\s*$/, "")}\n\n${footer}`;
+      return;
+    }
+
+    if (Array.isArray(content)) {
+      const lastTextIndex = [...content.keys()].reverse().find((index) => {
+        const part = content[index];
+        return isObject(part) && typeof part.text === "string";
+      });
+
+      if (lastTextIndex !== undefined) {
+        const part = content[lastTextIndex];
+        if (String(part.text || "").includes(footer)) return;
+        part.text = `${String(part.text || "").replace(/\s*$/, "")}\n\n${footer}`;
+        return;
+      }
+
+      if (content.length > 0) {
+        content.push({ type: "text", text: footer });
+        return;
+      }
+    }
+  }
+}
+
 function createStreamTerminationProbe(req: Request): StreamTerminationProbe | undefined {
   const enabled = flagEnabled(envOrHeader(req, "STREAM_TERMINATION_PROBE", "x-stream-termination-probe"), true);
   if (!enabled) return undefined;
@@ -1013,6 +1051,7 @@ function createStreamTerminationProbe(req: Request): StreamTerminationProbe | un
 
 function applyStreamTerminationProbe(payload: JsonObject, probe: StreamTerminationProbe | undefined): void {
   if (!probe) return;
+  appendProbeFooterToAssistantHistory(payload, STREAM_PROBE_HISTORY_TRAILER);
   injectSystemPrompt(payload, streamProbePrompt(probe.marker));
 }
 
