@@ -1073,21 +1073,23 @@ async function writeAndDrain(res: ExpressResponse, data: string): Promise<void> 
   if (!canContinue) await once(res, "drain");
 }
 
-async function destroyForProbe(res: ExpressResponse, abort: AbortController): Promise<void> {
-  // Maximum-violence cutoff: emit a TCP RST instead of a polite FIN. Node's
-  // resetAndDestroy() (≥18.3) sends RST directly, dropping anything still in
-  // the socket's send buffer. Clients receive ECONNRESET, which every HTTP
-  // and SSE library surfaces as a hard error rather than as a clean EOF —
-  // closer to "the wire was yanked" than the half-closed stream socket.destroy()
-  // produces. Fallback to socket.destroy() (FIN) only on older runtimes.
+async function emitTerminatedAndEnd(res: ExpressResponse, abort: AbortController, format: "openai" | "anthropic"): Promise<void> {
+  // 直接撕连接（FIN/RST）只让客户端看到网络错误，CherryStudio 仍会按已收到的
+  // text_delta 计输出 token，显示成 0/N 且无错误标记。改为按上游 provider 错误的
+  // 标准形态注入 "terminated" 错误事件：客户端把整次响应判为失败，丢弃所有累计
+  // 文本，UI 渲染为 status_code=500 / terminated，输入和输出 token 都归零。
   abort.abort();
-  const sock = res.socket as any;
-  if (!sock) return;
-  if (typeof sock.resetAndDestroy === "function") {
-    sock.resetAndDestroy();
+  if (res.destroyed || res.writableEnded) return;
+  if (format === "openai") {
+    // OpenRouter 在上游模型中途挂掉时下发的就是这种错误块。
+    await writeAndDrain(res, `data: ${JSON.stringify({ error: { message: "terminated", code: 500, type: "server_error" } })}\n\n`);
   } else {
-    sock.destroy();
+    // Anthropic Messages SSE 有专门的 terminal error 事件，客户端遇到后立即丢弃
+    // 进行中的 message，按错误对象渲染。
+    writeAnthropicSSE(res, "error", { type: "error", error: { type: "api_error", message: "terminated" } });
+    (res as any).flush?.();
   }
+  if (!res.writableEnded) res.end();
 }
 
 function filterOpenAIStreamChunk(chunk: JsonObject, probe: StreamTerminationProbe): { chunk: JsonObject; triggered: boolean } {
@@ -1179,23 +1181,18 @@ async function pipeOpenAIStream(payload: JsonObject, req: Request, res: ExpressR
           logProxyDebug("openai stream cut: sentinel", {
             model, chunks: chunkCount, usage_chunks: usageChunkCount, finish_reason: lastFinishReason,
           });
-          await destroyForProbe(res, abort);
+          await emitTerminatedAndEnd(res, abort, "openai");
           return;
         }
-        // Cut upstream as soon as the model's real finish_reason chunk arrives.
-        // The model is officially done; the trailing usage chunk would only add
-        // a network roundtrip. Works for tool_calls, stop, length — anything.
+        // 模型真实 finish_reason 一到就切断上游：跳过尾随的 usage chunk，把响应包装
+        // 成 "terminated" 错误事件下发给客户端，避免客户端按已收到的文本累计 token。
         if (probe.toolCallCutoff && chunkHasFinishReason(filtered.chunk)) {
           const usageBundled = filtered.chunk.usage !== undefined;
           logProxyDebug("openai stream cut: finish_reason", {
             model, chunks: chunkCount, usage_chunks: usageChunkCount,
             usage_bundled_in_finish_chunk: usageBundled, finish_reason: lastFinishReason,
           });
-          abort.abort();
-          const tail = probe.filter.flush();
-          if (tail) await writeAndDrain(res, `data: ${JSON.stringify(openAIContentChunk(tail))}\n\n`);
-          await writeAndDrain(res, "data: [DONE]\n\n");
-          if (!res.writableEnded) res.end();
+          await emitTerminatedAndEnd(res, abort, "openai");
           return;
         }
       }
@@ -1451,28 +1448,11 @@ async function streamOpenAIAsAnthropic(payload: JsonObject, req: Request, res: E
   };
 
   const finalizeAnthropicForProbe = async () => {
-    // Abort upstream the moment the model emits its real finish_reason.
-    // Skips the trailing usage chunk from the provider, but keeps stop_reason
-    // accurate (tool_use, end_turn, max_tokens, …) instead of hard-coding it.
-    if (probe) {
-      const tail = probe.filter.flush();
-      if (tail) {
-        const index = startTextBlock();
-        writeAnthropicSSE(res, "content_block_delta", { type: "content_block_delta", index, delta: { type: "text_delta", text: tail } });
-      }
-    }
-    stopReasoningBlock();
-    stopTextBlock();
-    stopToolBlocks();
-    abort.abort();
-    writeAnthropicSSE(res, "message_delta", {
-      type: "message_delta",
-      delta: { stop_reason: mapFinishReason(finishReason) || "end_turn", stop_sequence: null },
-      usage: { output_tokens: 0 },
-    });
-    writeAnthropicSSE(res, "message_stop", { type: "message_stop" });
-    (res as any).flush?.();
-    if (!res.writableEnded) res.end();
+    // 模型一旦给出真实 finish_reason 就直接发 error 事件结束流。不再补 tail、不再
+    // 写 message_delta/message_stop —— 那些会让客户端把响应判为正常完成，按已收到
+    // 的 text_delta 累计输出 token。改成 terminal error 事件后客户端会丢弃整段
+    // 进行中的 message，UI 渲染为 status_code=500 / terminated 且 token 全归零。
+    await emitTerminatedAndEnd(res, abort, "anthropic");
   };
 
   try {
@@ -1523,7 +1503,7 @@ async function streamOpenAIAsAnthropic(payload: JsonObject, req: Request, res: E
               model: externalModel, chunks: chunkCount, usage_chunks: usageChunkCount,
               finish_reason: finishReason, captured_usage: !!latestUsage,
             });
-            await destroyForProbe(res, abort);
+            await emitTerminatedAndEnd(res, abort, "anthropic");
             return;
           }
         }
