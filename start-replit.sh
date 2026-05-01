@@ -3,7 +3,22 @@ set -Eeuo pipefail
 
 cd "$(dirname "$0")"
 
+DEBUG_MODE=0
+for arg in "$@"; do
+  case "$arg" in
+    --debug) DEBUG_MODE=1 ;;
+    *) echo "==> Unknown argument ignored: $arg" >&2 ;;
+  esac
+done
+
+if [ "$DEBUG_MODE" = "1" ]; then
+  export DEBUG_PROXY=1
+fi
+
 echo "==> Workspace Runtime start"
+if [ "${DEBUG_PROXY:-}" = "1" ]; then
+  echo "==> Debug mode: DEBUG_PROXY=1 (proxy stream/cutoff logs enabled)"
+fi
 
 ensure_node_and_pnpm() {
   local wanted_pnpm="10.26.1"

@@ -28,4 +28,4 @@ fi
 git fetch origin "$BRANCH"
 git reset --hard "origin/$BRANCH"
 
-bash ./start-replit.sh
+bash ./start-replit.sh "$@"
