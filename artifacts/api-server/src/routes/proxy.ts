@@ -1074,12 +1074,14 @@ async function writeAndDrain(res: ExpressResponse, data: string): Promise<void> 
 }
 
 async function destroyForProbe(res: ExpressResponse, abort: AbortController): Promise<void> {
-  // Give Node one event-loop turn to flush already-written clean content before
-  // intentionally breaking the stream. The marker bytes are still filtered out.
-  (res as any).flush?.();
-  await new Promise((resolve) => setTimeout(resolve, 25));
+  // Mimic Node's requestTimeout cleanup: when its internal timer fires it just
+  // calls socket.destroy() — no flush wait, no res-level error, no graceful
+  // half-close. Already-buffered bytes drain through the kernel before FIN
+  // goes out; anything still in Node's stream buffer is dropped, exactly like
+  // a 5-minute requestTimeout cut. Tearing at the socket layer also frees the
+  // fd in the same tick, so keepalive intervals on res die immediately.
   abort.abort();
-  if (!res.destroyed) res.destroy(new Error("stream termination probe triggered"));
+  res.socket?.destroy();
 }
 
 function filterOpenAIStreamChunk(chunk: JsonObject, probe: StreamTerminationProbe): { chunk: JsonObject; triggered: boolean } {
