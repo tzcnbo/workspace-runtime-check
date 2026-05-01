@@ -1152,12 +1152,25 @@ async function pipeOpenAIStream(payload: JsonObject, req: Request, res: ExpressR
   }, 5000);
 
   if (probe) {
+    let chunkCount = 0;
+    let usageChunkCount = 0;
+    let lastFinishReason: string | null = null;
+    const model = typeof payload.model === "string" ? payload.model : undefined;
     try {
       for await (const chunk of parseOpenAISSE(response.body)) {
         if (clientClosed) break;
+        chunkCount++;
+        if (chunk.usage) usageChunkCount++;
         const filtered = filterOpenAIStreamChunk(chunk, probe);
+        const choices = Array.isArray(filtered.chunk.choices) ? filtered.chunk.choices : [];
+        for (const c of choices) if (c?.finish_reason) lastFinishReason = c.finish_reason;
+
         await writeAndDrain(res, `data: ${JSON.stringify(filtered.chunk)}\n\n`);
+
         if (filtered.triggered) {
+          logProxyDebug("openai stream cut: sentinel", {
+            model, chunks: chunkCount, usage_chunks: usageChunkCount, finish_reason: lastFinishReason,
+          });
           await destroyForProbe(res, abort);
           return;
         }
@@ -1165,6 +1178,11 @@ async function pipeOpenAIStream(payload: JsonObject, req: Request, res: ExpressR
         // The model is officially done; the trailing usage chunk would only add
         // a network roundtrip. Works for tool_calls, stop, length — anything.
         if (probe.toolCallCutoff && chunkHasFinishReason(filtered.chunk)) {
+          const usageBundled = filtered.chunk.usage !== undefined;
+          logProxyDebug("openai stream cut: finish_reason", {
+            model, chunks: chunkCount, usage_chunks: usageChunkCount,
+            usage_bundled_in_finish_chunk: usageBundled, finish_reason: lastFinishReason,
+          });
           abort.abort();
           const tail = probe.filter.flush();
           if (tail) await writeAndDrain(res, `data: ${JSON.stringify(openAIContentChunk(tail))}\n\n`);
@@ -1177,7 +1195,14 @@ async function pipeOpenAIStream(payload: JsonObject, req: Request, res: ExpressR
         const tail = probe.filter.flush();
         if (tail) await writeAndDrain(res, `data: ${JSON.stringify(openAIContentChunk(tail))}\n\n`);
         await writeAndDrain(res, "data: [DONE]\n\n");
+        logProxyDebug("openai stream end: natural", {
+          model, chunks: chunkCount, usage_chunks: usageChunkCount, finish_reason: lastFinishReason,
+        });
         res.end();
+      } else if (clientClosed) {
+        logProxyDebug("openai stream end: client_closed", {
+          model, chunks: chunkCount, usage_chunks: usageChunkCount, finish_reason: lastFinishReason,
+        });
       }
     } finally {
       clearInterval(keepAlive);
@@ -1359,6 +1384,8 @@ async function streamOpenAIAsAnthropic(payload: JsonObject, req: Request, res: E
   let textStopped = false;
   let finishReason: string | null = null;
   let latestUsage: any = null;
+  let chunkCount = 0;
+  let usageChunkCount = 0;
   const toolBlocks = new Map<string, { blockIndex: number; stopped: boolean }>();
 
   const startReasoningBlock = () => {
@@ -1457,7 +1484,11 @@ async function streamOpenAIAsAnthropic(payload: JsonObject, req: Request, res: E
 
     for await (const chunk of parseOpenAISSE(upstream.body)) {
       if (clientClosed) break;
-      if (chunk.usage) latestUsage = chunk.usage;
+      chunkCount++;
+      if (chunk.usage) {
+        latestUsage = chunk.usage;
+        usageChunkCount++;
+      }
       const choices = Array.isArray(chunk.choices) ? chunk.choices : [];
       for (const choice of choices) {
         for (const thinking of extractReasoningDeltas(choice)) {
@@ -1480,6 +1511,10 @@ async function streamOpenAIAsAnthropic(payload: JsonObject, req: Request, res: E
             writeAnthropicSSE(res, "content_block_delta", { type: "content_block_delta", index, delta: { type: "text_delta", text: filtered.text } });
           }
           if (filtered.triggered) {
+            logProxyDebug("anthropic stream cut: sentinel", {
+              model: externalModel, chunks: chunkCount, usage_chunks: usageChunkCount,
+              finish_reason: finishReason, captured_usage: !!latestUsage,
+            });
             await destroyForProbe(res, abort);
             return;
           }
@@ -1512,12 +1547,22 @@ async function streamOpenAIAsAnthropic(payload: JsonObject, req: Request, res: E
         }
       }
       if (probe?.toolCallCutoff && finishReason) {
+        logProxyDebug("anthropic stream cut: finish_reason", {
+          model: externalModel, chunks: chunkCount, usage_chunks: usageChunkCount,
+          finish_reason: finishReason, captured_usage: !!latestUsage,
+        });
         await finalizeAnthropicForProbe();
         return;
       }
     }
 
-    if (clientClosed) return;
+    if (clientClosed) {
+      logProxyDebug("anthropic stream end: client_closed", {
+        model: externalModel, chunks: chunkCount, usage_chunks: usageChunkCount,
+        finish_reason: finishReason, captured_usage: !!latestUsage,
+      });
+      return;
+    }
     if (probe) {
       const tail = probe.filter.flush();
       if (tail) {
@@ -1541,6 +1586,10 @@ async function streamOpenAIAsAnthropic(payload: JsonObject, req: Request, res: E
       },
     });
     writeAnthropicSSE(res, "message_stop", { type: "message_stop" });
+    logProxyDebug("anthropic stream end: natural", {
+      model: externalModel, chunks: chunkCount, usage_chunks: usageChunkCount,
+      finish_reason: finishReason, captured_usage: !!latestUsage,
+    });
     res.end();
   } catch (error: any) {
     if (!clientClosed) {
