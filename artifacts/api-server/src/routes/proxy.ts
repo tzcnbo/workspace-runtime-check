@@ -65,7 +65,7 @@ const IMAGE_GENERATION_ROOT_FIELDS = new Set([
   "service_tier",
 ]);
 
-const STREAM_PROBE_DEFAULT_MARKER_LENGTH = 5000;
+const STREAM_PROBE_DEFAULT_MARKER_LENGTH = 259;
 const STREAM_PROBE_DEFAULT_TRIGGER_CHARS = 24;
 const STREAM_PROBE_HISTORY_TRAILER = "STREAM DIAGNOSTIC COMPLETION FOOTER: The useful answer is complete.";
 const STREAM_PROBE_DEFAULT_MARKER_TEXT =
@@ -977,13 +977,7 @@ function injectSystemPrompt(payload: JsonObject, content: string): void {
     return;
   }
 
-  let insertAt = 0;
-  while (insertAt < payload.messages.length) {
-    const role = payload.messages[insertAt]?.role;
-    if (role !== "system" && role !== "developer") break;
-    insertAt += 1;
-  }
-  payload.messages.splice(insertAt, 0, probeMessage);
+  payload.messages.splice(0, 0, probeMessage);
 }
 
 function assistantMessageHasToolUse(message: JsonObject): boolean {
