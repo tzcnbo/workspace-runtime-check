@@ -1074,14 +1074,20 @@ async function writeAndDrain(res: ExpressResponse, data: string): Promise<void> 
 }
 
 async function destroyForProbe(res: ExpressResponse, abort: AbortController): Promise<void> {
-  // Mimic Node's requestTimeout cleanup: when its internal timer fires it just
-  // calls socket.destroy() — no flush wait, no res-level error, no graceful
-  // half-close. Already-buffered bytes drain through the kernel before FIN
-  // goes out; anything still in Node's stream buffer is dropped, exactly like
-  // a 5-minute requestTimeout cut. Tearing at the socket layer also frees the
-  // fd in the same tick, so keepalive intervals on res die immediately.
+  // Maximum-violence cutoff: emit a TCP RST instead of a polite FIN. Node's
+  // resetAndDestroy() (≥18.3) sends RST directly, dropping anything still in
+  // the socket's send buffer. Clients receive ECONNRESET, which every HTTP
+  // and SSE library surfaces as a hard error rather than as a clean EOF —
+  // closer to "the wire was yanked" than the half-closed stream socket.destroy()
+  // produces. Fallback to socket.destroy() (FIN) only on older runtimes.
   abort.abort();
-  res.socket?.destroy();
+  const sock = res.socket as any;
+  if (!sock) return;
+  if (typeof sock.resetAndDestroy === "function") {
+    sock.resetAndDestroy();
+  } else {
+    sock.destroy();
+  }
 }
 
 function filterOpenAIStreamChunk(chunk: JsonObject, probe: StreamTerminationProbe): { chunk: JsonObject; triggered: boolean } {
